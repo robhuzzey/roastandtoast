@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Darumadrop_One } from "next/font/google";
+import { GoogleAnalytics } from "@next/third-parties/google";
 import "./globals.css";
 
 const font = Darumadrop_One({
@@ -21,6 +22,7 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className={`${font.variable} antialiased`}>{children}</body>
+      <GoogleAnalytics gaId="G-2DKYTX19YG" />
     </html>
   );
 }
