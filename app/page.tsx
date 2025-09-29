@@ -88,7 +88,6 @@ export default function Home() {
               priority
             />
           </div>
-          <Countdown />
           <div className="w-full flex items-center justify-center my-6">
             <iframe
               title="Roast and Toast Location"
