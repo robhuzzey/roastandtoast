@@ -26,6 +26,35 @@ type Morpheme = {
 type Segmented = Morpheme[];
 type PersonKey = "ben" | "sen" | "o" | "biz" | "siz" | "onlar";
 
+type ExampleWord = {
+  surface: string;
+  segments: Segmented;
+  gloss?: string; // optional short gloss from API
+};
+
+type QuickPhrase = { key: string; tr: string; en: string };
+
+type SuffixTeaching = {
+  id: string; // e.g., "accusative", "dative"
+  label: string; // human label
+  concept?: string; // short what/when
+  rule?: string; // how it attaches (harmony notes, buffers)
+  example_tr?: string;
+  example_en?: string;
+};
+
+type Drill = {
+  prompt_en?: string;
+  prompt_tr?: string; // may contain a blank using "___" or brackets
+  answer_tr: string;
+  explanation?: string;
+};
+
+type Teaching = {
+  suffixes?: Array<SuffixTeaching>;
+  drills?: Array<Drill>;
+};
+
 type ApiResponse = {
   english: string;
   turkish: {
@@ -40,14 +69,23 @@ type ApiResponse = {
       { surface: string; segments: Segmented }
     >;
   };
-  inflections: Array<{ label: string; surface: string; segments: Segmented }>;
+  inflections: Array<{
+    label: string;
+    surface: string;
+    segments: Segmented;
+    display_title?: string;
+    display_hint?: string;
+    priority?: number;
+  }>;
   examples: Array<{
     en: string;
     tr: {
       surface: string; // well-spaced sentence
-      words: Array<{ surface: string; segments: Segmented }>; // segmentation by word (no inner spaces added)
+      words: Array<ExampleWord>; // segmentation by word + optional gloss
     };
   }>;
+  quick_phrases?: Array<QuickPhrase>;
+  teaching?: Teaching;
 };
 
 /** Colors */
@@ -114,7 +152,6 @@ function useTurkishSpeech() {
     // Prefer voices with Turkish locale
     const primary = voices.find((v) => v.lang?.toLowerCase().startsWith("tr"));
     if (primary) return primary;
-    // Some list as en-TR or similar – fallback: includes('-tr')
     const secondary = voices.find((v) => v.lang?.toLowerCase().includes("-tr"));
     return secondary || null;
   }, [voices]);
@@ -126,16 +163,13 @@ function useTurkishSpeech() {
     const t = (text || "").trim();
     if (!t) return;
     const synth = window.speechSynthesis;
-    // Cancel any current speech to avoid overlap
     try {
       synth.cancel();
     } catch {}
 
     const utt = new SpeechSynthesisUtterance(t);
-    // Set Turkish where possible
     utt.lang = "tr-TR";
     if (trVoice) utt.voice = trVoice;
-    // Fine-tune for clarity
     utt.rate = 0.95;
     utt.pitch = 1.0;
     synth.speak(utt);
@@ -193,116 +227,7 @@ function InfoIcon({ className }: { className?: string }) {
   );
 }
 
-/** ---- Progressive -(I)yor sanitizer (client-side safety net) ---- */
-
-const VOWELS = ["a", "e", "ı", "i", "o", "ö", "u", "ü"];
-
-function lastVowel(s: string): string | null {
-  for (let i = s.length - 1; i >= 0; i--) {
-    const ch = s[i].toLowerCase();
-    if (VOWELS.includes(ch)) return ch;
-  }
-  return null;
-}
-
-function highVowelFor(v: string | null): string {
-  switch (v) {
-    case "a":
-    case "ı":
-      return "ı"; // back, unrounded
-    case "e":
-    case "i":
-      return "i"; // front, unrounded
-    case "o":
-    case "u":
-      return "u"; // back, rounded
-    case "ö":
-    case "ü":
-      return "ü"; // front, rounded
-    default:
-      return "ı"; // fallback
-  }
-}
-
-/** Progressive -(I)yor normalizer + contraction rule
- *  - ensures correct high vowel (ı/i/u/ü) before 'yor'
- *  - if the root ends with -a/-e, DROP that vowel (anla→anl + ı + yor = anlıyor)
- */
-function sanitizeProgressiveSegments(segs: Segmented): Segmented {
-  const out: Segmented = segs.map((s) => ({ ...s })); // shallow clone
-
-  for (let i = 0; i < out.length; i++) {
-    const cur = out[i];
-    // Treat any tense that ends with 'yor' as progressive (handles 'yor', 'iyor', 'ıyor', 'uyor', 'üyor', even 'ayor/eyor')
-    if (
-      !(
-        cur.type === "tense" &&
-        cur.text &&
-        cur.text.toLowerCase().endsWith("yor")
-      )
-    )
-      continue;
-
-    // Find the last root segment BEFORE 'yor'
-    let rootIdx = -1;
-    for (let j = i - 1; j >= 0; j--) {
-      if (out[j].type === "root") {
-        rootIdx = j;
-        break;
-      }
-    }
-    const rootText = rootIdx >= 0 ? out[rootIdx].text : "";
-    const lv = lastVowel(rootText);
-    const hv = highVowelFor(lv); // ı/i/u/ü depending on last vowel
-
-    // 0) Normalize the tense morpheme text to just 'yor' (if it was 'iyor', 'ayor', etc.)
-    if (cur.text.toLowerCase() !== "yor") {
-      out[i] = { ...cur, text: "yor" };
-    }
-
-    // 1) Ensure harmony vowel is immediately before 'yor'
-    const prevIdx = i - 1;
-    if (prevIdx >= 0 && out[prevIdx].type === "harmony_vowel") {
-      // normalize whatever is there to the correct high vowel
-      out[prevIdx].text = hv;
-    } else {
-      // insert the harmony vowel before 'yor'
-      out.splice(i, 0, { text: hv, type: "harmony_vowel" });
-      i++; // move past the inserted HV
-    }
-
-    // 2) Contraction: if root ends with -a/-e, drop it (anla→anl, bekle→bekl, havla→havl)
-    if (rootIdx >= 0 && /[ae]$/i.test(out[rootIdx].text)) {
-      out[rootIdx].text = out[rootIdx].text.slice(0, -1);
-    }
-
-    // 3) Clean up stray low-vowel HVs (some LLM outputs add an 'a'/'e' HV earlier)
-    const maybeLowHv = i - 2;
-    if (
-      maybeLowHv >= 0 &&
-      out[maybeLowHv].type === "harmony_vowel" &&
-      /^[ae]$/i.test(out[maybeLowHv].text)
-    ) {
-      out.splice(maybeLowHv, 1);
-      i--;
-    }
-  }
-
-  return out;
-}
-
-/** Wrap a segments array with sanitizer if it contains 'yor' tense */
-function sanitizeIfProgressive(segs: Segmented): Segmented {
-  if (
-    segs.some(
-      (s) =>
-        s.type === "tense" && s.text && s.text.toLowerCase().endsWith("yor")
-    )
-  ) {
-    return sanitizeProgressiveSegments(segs);
-  }
-  return segs;
-}
+// No client-side morphology mutation; render as-is from API.
 
 /** One morpheme, with global sentence hover dim + clear tooltip */
 function MorphemePiece({ m }: { m: Morpheme }) {
@@ -350,21 +275,13 @@ function MorphemePiece({ m }: { m: Morpheme }) {
 
 /** Word = continuous string of morphemes (no added gaps inside) */
 function SegmentedWord({ segs }: { segs: Segmented }) {
-  const safe = sanitizeIfProgressive(segs);
   return (
     <span className="inline-block align-baseline px-0.5">
-      {safe.map((m, i) => (
+      {segs.map((m, i) => (
         <MorphemePiece key={i} m={m} />
       ))}
     </span>
   );
-}
-
-/** Build a surface string from segments (sanitized), with no extra spaces */
-function segmentsToSurface(segs: Segmented): string {
-  return sanitizeIfProgressive(segs)
-    .map((s) => s.text)
-    .join("");
 }
 
 /** Extract the last root morpheme for a word */
@@ -375,136 +292,23 @@ function getWordRoot(segs: Segmented): string | null {
   return null;
 }
 
-/** Basic A/E chooser by last vowel of the token */
-function chooseAE(word: string): "a" | "e" {
-  const v = lastVowel(word || "");
-  // front vowels: e, i, ö, ü → 'e'; back vowels: a, ı, o, u → 'a'
-  return v && ["e", "i", "ö", "ü"].includes(v) ? "e" : "a";
-}
-
-/** Build -mak/-mek infinitive from lemma/stem */
-function makeInfinitive(lemma: string, stem: string): string {
-  const l = lemma || "";
-  if (/m[ea]k$/i.test(l)) return l; // already an infinitive
-  const base = (stem && stem.trim()) || l;
-  const hv = lastVowel(base);
-  const mk = hv && ["e", "i", "ö", "ü"].includes(hv) ? "mek" : "mak";
-  return `${base}${mk}`;
-}
-
-/** Pick an inflection by label substring */
-function pickInflectionByLabel(
-  infs: Array<{ label: string; surface: string; segments: Segmented }>,
-  needle: string
-) {
-  const n = needle.toLowerCase();
-  return infs.find((x) => (x.label || "").toLowerCase().includes(n));
-}
-
-/** Build simple quick phrases for common intents */
-function buildQuickPhrase(
-  kind: string,
-  data: ApiResponse | null
-): { tr: string; en: string } {
-  if (!data) return { tr: "", en: "" };
-  const pos = data.turkish.pos;
-  const lemma = data.turkish.lemma;
-  const stem = data.turkish.stem;
-  const infs = data.inflections || [];
-
-  if (pos === "noun") {
-    const acc = pickInflectionByLabel(infs, "accusative")?.surface || lemma;
-    const poss1 = pickInflectionByLabel(infs, "1sg")?.surface || lemma; // my NOUN
-    switch (kind) {
-      case "have":
-        return { tr: `Benim ${poss1} var.`, en: "I have NOUN." };
-      case "want":
-        return { tr: `${acc} istiyorum.`, en: "I want NOUN." };
-      case "canihave":
-        return { tr: `Bir ${lemma} alabilir miyim?`, en: "Can I have NOUN?" };
-      case "like":
-        return { tr: `${acc} seviyorum.`, en: "I like NOUN." };
-      case "where":
-        return { tr: `${lemma} nerede?`, en: "Where is NOUN?" };
-      default:
-        return { tr: lemma, en: "" };
-    }
-  } else if (pos === "verb") {
-    const infinitive = makeInfinitive(lemma, stem);
-    const aOrE = chooseAE(lemma || stem || "");
-    const pc1sg = data.conjugations?.present_continuous?.ben?.surface;
-    switch (kind) {
-      case "have":
-        return { tr: pc1sg || `${stem}yorum`, en: "I am VERBing." };
-      case "want":
-        return { tr: `${infinitive} istiyorum.`, en: "I want to VERB." };
-      case "canihave":
-        return { tr: `${stem}${aOrE}bilir miyim?`, en: "Can I VERB?" };
-      case "like":
-        return { tr: `${infinitive} seviyorum.`, en: "I like to VERB." };
-      case "where":
-        return { tr: `${lemma}?`, en: "(Not typical for verbs)" };
-      default:
-        return { tr: infinitive, en: "" };
-    }
-  }
-  // other POS
-  switch (kind) {
-    case "have":
-      return { tr: `${lemma} var.`, en: "There is/are NOUN." };
-    case "where":
-      return { tr: `${lemma} nerede?`, en: "Where is it?" };
-    default:
-      return { tr: lemma, en: "" };
-  }
-}
-
-/** Fetch simple English glosses for given Turkish words via OpenAI */
-async function fetchGlosses(
-  apiKey: string,
-  words: string[]
-): Promise<Record<string, string>> {
-  const prompt = `Return a JSON object mapping each Turkish word to a short English gloss (1–3 words). Keys must be exactly the provided words (lowercase). Words: ${JSON.stringify(
-    words
-  )}`;
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      temperature: 0,
-      response_format: { type: "json_object" },
-      messages: [
-        {
-          role: "system",
-          content: "You map Turkish words to short English glosses.",
-        },
-        { role: "user", content: prompt },
-      ],
-    }),
-  });
-  if (!res.ok) throw new Error(`Gloss HTTP ${res.status}`);
-  const json = await res.json();
-  const content = json?.choices?.[0]?.message?.content || "{}";
-  try {
-    const obj = typeof content === "string" ? JSON.parse(content) : content;
-    return obj && typeof obj === "object" ? obj : {};
-  } catch {
-    return {};
-  }
-}
-
 /** Friendlier labels for cases & possessives */
-function getInflectionDisplay(rawLabel: string): {
+function getInflectionDisplay(inf: {
+  label: string;
+  display_title?: string;
+  display_hint?: string;
+}): {
   title: string;
   hint: string;
 } {
-  const label = (rawLabel || "").toLowerCase();
+  if (inf.display_title || inf.display_hint) {
+    return {
+      title: inf.display_title || inf.label,
+      hint: inf.display_hint || "",
+    };
+  }
+  const label = (inf.label || "").toLowerCase();
 
-  // Cases
   if (label.includes("accusative"))
     return {
       title: "Accusative (direct object)",
@@ -524,12 +328,9 @@ function getInflectionDisplay(rawLabel: string): {
     label === "ile"
   )
     return { title: 'With ("ile")', hint: "with the NOUN" };
-
-  // Number
   if (label.includes("plural"))
     return { title: "Plural", hint: "more than one (nouns)" };
 
-  // Possessives
   const person = label.match(/(1sg|2sg|3sg|1pl|2pl|3pl)/i)?.[1]?.toLowerCase();
   if (person) {
     switch (person) {
@@ -554,20 +355,19 @@ function getInflectionDisplay(rawLabel: string): {
     }
   }
 
-  // Fallback - title case first letter
-  const title = rawLabel
-    ? rawLabel[0].toUpperCase() + rawLabel.slice(1)
+  const title = inf.label
+    ? inf.label[0].toUpperCase() + inf.label.slice(1)
     : "Form";
   return { title, hint: "" };
 }
 
-/** Sentence: single line, preserve spacing, global hover also scales sentence a bit more */
+/** Sentence: single line, preserve spacing */
 function SegmentedSentence({
   words,
   glosses,
   targetLemma,
 }: {
-  words: Array<{ surface: string; segments: Segmented }>;
+  words: Array<ExampleWord>;
   glosses?: Record<string, string>;
   targetLemma?: string;
 }) {
@@ -578,13 +378,15 @@ function SegmentedSentence({
         const isTarget =
           root && targetLemma ? root === targetLemma.toLowerCase() : false;
         const glossKey = (w.surface || "").toLowerCase();
-        const gloss = !isTarget && glosses ? glosses[glossKey] : undefined;
+        const providedGloss = w.gloss;
+        const gloss = !isTarget
+          ? providedGloss || (glosses ? glosses[glossKey] : undefined)
+          : undefined;
         return (
           <span
             key={idx}
             className="relative inline-block align-baseline group/word"
           >
-            {/* word-level gloss tooltip */}
             {gloss && (
               <span className="pointer-events-none absolute -top-6 left-1/2 -translate-x-1/2 px-2 py-0.5 rounded bg-black/80 text-white text-[11px] shadow-sm whitespace-nowrap opacity-0 group-hover/word:opacity-100 transition-opacity">
                 {gloss}
@@ -607,11 +409,7 @@ export default function Page() {
   const [error, setError] = useState<string | null>(null);
   const [showKey, setShowKey] = useState(false);
   const [showUsefulLegend, setShowUsefulLegend] = useState(false);
-  const [showAllInflections, setShowAllInflections] = useState(false);
   const [glossMap, setGlossMap] = useState<Record<string, string>>({});
-  const [glossLoading, setGlossLoading] = useState(false);
-  const [selectedPhrase, setSelectedPhrase] = useState<string>("have");
-  // Token/Rate-limit telemetry for the main Analyze request
   const [tokenUsage, setTokenUsage] = useState<{
     prompt: number;
     completion: number;
@@ -621,6 +419,9 @@ export default function Page() {
     null
   );
   const [rateLimitTokens, setRateLimitTokens] = useState<number | null>(null);
+  const [revealedDrills, setRevealedDrills] = useState<Record<number, boolean>>(
+    {}
+  );
   const { speak, hasVoice } = useTurkishSpeech();
 
   /** Persist API key */
@@ -642,44 +443,29 @@ export default function Page() {
     [apiKey, english]
   );
 
-  /** Glossing: fetch simple English glosses for new words in examples */
+  /** Glossing: provided by API in examples; seed into local map */
   useEffect(() => {
-    async function run() {
-      if (!data || !apiKey) return;
-      const words = new Set<string>();
-      const target = (data.turkish.lemma || "").toLowerCase();
-      for (const ex of data.examples || []) {
-        for (const w of ex.tr.words) {
-          const root = getWordRoot(w.segments)?.toLowerCase();
-          const surf = (w.surface || "").toLowerCase();
-          if (!surf) continue;
-          if (root && root === target) continue; // don't gloss the main word
-          if (glossMap[surf] !== undefined) continue; // already have
-          words.add(surf);
-        }
-      }
-      const toFetch = Array.from(words).slice(0, 30);
-      if (toFetch.length === 0) return;
-      setGlossLoading(true);
-      try {
-        const mapping = await fetchGlosses(apiKey, toFetch);
-        setGlossMap((prev) => ({ ...prev, ...mapping }));
-      } catch (e: unknown) {
-        // non-fatal, just skip glosses
-        console.warn?.("gloss fetch failed", e);
-      } finally {
-        setGlossLoading(false);
+    if (!data) return;
+    const target = (data.turkish.lemma || "").toLowerCase();
+    const incoming: Record<string, string> = {};
+    for (const ex of data.examples || []) {
+      for (const w of ex.tr.words) {
+        const root = getWordRoot(w.segments)?.toLowerCase();
+        const surf = (w.surface || "").toLowerCase();
+        if (!surf) continue;
+        if (root && root === target) continue;
+        if (w.gloss) incoming[surf] = w.gloss;
       }
     }
-    run();
-    // only rerun when data changes significantly or apiKey changes
-  }, [data, apiKey, glossMap]);
+    if (Object.keys(incoming).length) {
+      setGlossMap((prev) => ({ ...incoming, ...prev }));
+    }
+  }, [data]);
 
   async function query() {
     setLoading(true);
     setError(null);
     setData(null);
-    // reset token telemetry for the new request
     setTokenUsage(null);
     setRateRemainingTokens(null);
     setRateLimitTokens(null);
@@ -689,6 +475,13 @@ export default function Page() {
 You are a Turkish morphology tutor and analyzer.
 Return STRICT JSON matching the provided JSON Schema.
 ALWAYS include: english, turkish, notes, conjugations, inflections, examples.
+
+Also include quick_phrases: a small set of common starter phrases tailored to the lemma/part of speech.
+For each inflection, you MUST include display_title and display_hint (short, beginner-friendly), and a numeric priority (lower = more useful).
+For examples.tr.words[], include a short English gloss per word (1–3 words). If not applicable, use an empty string.
+Include a teaching section with:
+  • suffixes: short cards for 3–6 relevant suffix topics (e.g., plural, cases, possessives, -(I)yor for verbs), each with id, label, concept (when to use), rule (how to attach, harmony/buffer notes), and one minimal example (example_tr/example_en). All these fields must be present (use empty strings if unknown).
+  • drills: 2–5 micro exercises; include prompt_en, prompt_tr, answer_tr, and a one-line explanation. All fields must be present; use empty strings where not applicable, but keep answer_tr non-empty.
 
 VERBS:
 - Present continuous must follow Turkish high-vowel assimilation:
@@ -715,6 +508,12 @@ EXAMPLES:
 - Also include tr.words: array of words, each segmented for that word ONLY (no mid-word spaces added by you).
 - The joined tr.words.surface with single spaces MUST equal tr.surface (ignoring punctuation spacing).
 - No hyphens in surface.
+ - Where possible, include a short gloss for content words in tr.words[].gloss.
+
+QUICK PHRASES:
+- Provide 4–8 useful phrases as quick_phrases: [{ key, tr, en }]. Always include this array (can be empty if truly none).
+- Choose patterns that fit the lemma/POS (e.g., for nouns: I have NOUN, I want NOUN, Can I have NOUN?, I like NOUN, Where is NOUN?; for verbs: I want to VERB, I can VERB, I'm VERBing, etc.).
+- Keep them short and natural.
 
 CLARITY:
 - Avoid the "other" tag by mapping to the best category; if still used, add a brief note.
@@ -790,8 +589,61 @@ CLARITY:
                     },
                     examples: {
                       type: "array",
-                      items: exampleObjSchema(), // words[] keeps spacing correct
+                      items: exampleObjSchema(),
                       minItems: 1,
+                    },
+                    quick_phrases: {
+                      type: "array",
+                      items: quickPhraseObjSchema(),
+                    },
+                    teaching: {
+                      type: "object",
+                      additionalProperties: false,
+                      properties: {
+                        suffixes: {
+                          type: "array",
+                          items: {
+                            type: "object",
+                            additionalProperties: false,
+                            properties: {
+                              id: { type: "string" },
+                              label: { type: "string" },
+                              concept: { type: "string" },
+                              rule: { type: "string" },
+                              example_tr: { type: "string" },
+                              example_en: { type: "string" },
+                            },
+                            required: [
+                              "id",
+                              "label",
+                              "concept",
+                              "rule",
+                              "example_tr",
+                              "example_en",
+                            ],
+                          },
+                        },
+                        drills: {
+                          type: "array",
+                          items: {
+                            type: "object",
+                            additionalProperties: false,
+                            properties: {
+                              prompt_en: { type: "string" },
+                              prompt_tr: { type: "string" },
+                              answer_tr: { type: "string" },
+                              explanation: { type: "string" },
+                            },
+                            required: [
+                              "prompt_en",
+                              "prompt_tr",
+                              "answer_tr",
+                              "explanation",
+                            ],
+                          },
+                        },
+                      },
+                      required: ["suffixes", "drills"],
                     },
                   },
                   required: [
@@ -801,6 +653,8 @@ CLARITY:
                     "conjugations",
                     "inflections",
                     "examples",
+                    "quick_phrases",
+                    "teaching",
                   ],
                 },
               },
@@ -827,7 +681,6 @@ CLARITY:
       if (!Number.isNaN(limNum as number)) setRateLimitTokens(limNum);
 
       const json = await response.json();
-      // Capture token usage from the response body
       const usage = json?.usage;
       if (usage) {
         const prompt = Number(usage.prompt_tokens) || 0;
@@ -846,31 +699,6 @@ CLARITY:
       setLoading(false);
     }
   }
-
-  /** ---- Inflection sorting & friendly rendering ---- */
-  function getInflectionPriority(rawLabel: string): number {
-    const s = (rawLabel || "").toLowerCase();
-    // Top picks
-    if (s.includes("accusative")) return 0; // direct object
-    if (s.includes("dative")) return 1; // to/towards
-    if (s.includes("plural")) return 2; // common
-    if (/(^|\b)1sg(\b|$)/.test(s) || s.includes("1sg")) return 3; // my
-    // The rest
-    if (s.includes("locative")) return 4; // in/at/on
-    if (s.includes("ablative")) return 5; // from
-    if (s.includes("genitive")) return 6; // of
-    if (s.includes("instrumental") || s.includes(" ile") || s === "ile")
-      return 7; // with
-    if (/(2sg|3sg|1pl|2pl|3pl)/.test(s)) return 8; // other possessives
-    return 9;
-  }
-
-  const sortedInflections = useMemo(() => {
-    const list = data?.inflections || [];
-    return [...list].sort(
-      (a, b) => getInflectionPriority(a.label) - getInflectionPriority(b.label)
-    );
-  }, [data]);
 
   const hasPC =
     !!data?.conjugations?.present_continuous &&
@@ -1037,7 +865,6 @@ CLARITY:
                   </div>
                 </div>
 
-                {/* Present continuous only if real forms provided */}
                 {hasPC ? (
                   <div className="space-y-2">
                     <h3 className="font-medium">
@@ -1063,14 +890,7 @@ CLARITY:
                               type="button"
                               title={hasVoice ? "Speak (Turkish)" : "Speak"}
                               aria-label="Speak"
-                              onClick={() =>
-                                speak(
-                                  (val.surface && val.surface.trim()) ||
-                                    (val.segments && val.segments.length
-                                      ? segmentsToSurface(val.segments)
-                                      : "")
-                                )
-                              }
+                              onClick={() => speak((val.surface || "").trim())}
                               className="inline-flex items-center justify-center w-7 h-7 rounded-full hover:bg-slate-200 text-slate-700"
                             >
                               <SpeakerIcon className="w-4 h-4" />
@@ -1080,9 +900,7 @@ CLARITY:
                             words={[
                               {
                                 surface: val.surface || "",
-                                segments: val.segments
-                                  ? sanitizeIfProgressive(val.segments)
-                                  : [],
+                                segments: val.segments || [],
                               },
                             ]}
                           />
@@ -1096,8 +914,7 @@ CLARITY:
                   </p>
                 )}
 
-                {/* Useful forms (possessives, cases, plural) */}
-                {sortedInflections && sortedInflections.length > 0 && (
+                {data.inflections && data.inflections.length > 0 && (
                   <div className="space-y-2">
                     <div className="flex items-center justify-between">
                       <h3 className="font-medium">Useful forms</h3>
@@ -1113,7 +930,6 @@ CLARITY:
                         {showUsefulLegend ? "Hide legend" : "Show legend"}
                       </button>
                     </div>
-                    {/* Mini legend for beginners */}
                     {showUsefulLegend && (
                       <div
                         id="useful-legend"
@@ -1176,11 +992,8 @@ CLARITY:
                       </div>
                     )}
                     <div className="grid sm:grid-cols-2 gap-3">
-                      {(showAllInflections
-                        ? sortedInflections
-                        : sortedInflections.slice(0, 4)
-                      ).map((inf, i) => {
-                        const d = getInflectionDisplay(inf.label);
+                      {data.inflections.map((inf, i) => {
+                        const d = getInflectionDisplay(inf);
                         return (
                           <div
                             key={i}
@@ -1211,7 +1024,7 @@ CLARITY:
                               words={[
                                 {
                                   surface: inf.surface,
-                                  segments: sanitizeIfProgressive(inf.segments),
+                                  segments: inf.segments,
                                 },
                               ]}
                             />
@@ -1219,17 +1032,6 @@ CLARITY:
                         );
                       })}
                     </div>
-                    {sortedInflections.length > 4 && (
-                      <div>
-                        <button
-                          type="button"
-                          onClick={() => setShowAllInflections((v) => !v)}
-                          className="text-xs text-slate-600 underline hover:text-slate-800"
-                        >
-                          {showAllInflections ? "Show fewer" : "Show all"}
-                        </button>
-                      </div>
-                    )}
                     <div className="space-y-3">
                       {data.examples.map((ex, i) => (
                         <div
@@ -1251,69 +1053,165 @@ CLARITY:
                             </button>
                           </div>
                           <SegmentedSentence
-                            words={ex.tr.words.map(
-                              (w: {
-                                surface: string;
-                                segments: Segmented;
-                              }) => ({
-                                surface: w.surface,
-                                segments: sanitizeIfProgressive(w.segments),
-                              })
-                            )}
+                            words={ex.tr.words}
                             glosses={glossMap}
                             targetLemma={data.turkish.lemma}
                           />
                         </div>
                       ))}
-                      {glossLoading && (
-                        <div className="text-xs text-slate-500">
-                          Loading word glosses…
-                        </div>
-                      )}
                     </div>
                   </div>
                 )}
 
-                {/* Quick phrases */}
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <h3 className="font-medium">Quick phrases</h3>
-                  </div>
-                  <div className="flex flex-col sm:flex-row gap-2 sm:items-center">
-                    <select
-                      className="rounded-xl border px-3 py-2 w-full sm:w-auto"
-                      value={selectedPhrase}
-                      onChange={(e) => setSelectedPhrase(e.target.value)}
-                    >
-                      <option value="have">I have NOUN</option>
-                      <option value="want">I want NOUN</option>
-                      <option value="canihave">Can I have NOUN?</option>
-                      <option value="like">I like NOUN</option>
-                      <option value="where">Where is NOUN?</option>
-                    </select>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        speak(buildQuickPhrase(selectedPhrase, data).tr)
-                      }
-                      className="inline-flex items-center gap-2 rounded-xl px-3 py-2 border hover:bg-slate-100 text-slate-700"
-                    >
-                      <SpeakerIcon className="w-4 h-4" />
-                      Speak
-                    </button>
-                  </div>
-                  <div className="p-3 rounded-xl border bg-slate-50">
-                    <div className="text-xs text-slate-600 mb-1">Turkish</div>
-                    <div className="text-base">
-                      {buildQuickPhrase(selectedPhrase, data).tr}
+                {data.quick_phrases && data.quick_phrases.length > 0 && (
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <h3 className="font-medium">Quick phrases</h3>
                     </div>
-                    <div className="mt-1 text-xs text-slate-500">
-                      EN: {buildQuickPhrase(selectedPhrase, data).en}
+                    <div className="grid sm:grid-cols-2 gap-3">
+                      {data.quick_phrases.map((qp, idx) => (
+                        <div
+                          key={idx}
+                          className="p-3 rounded-xl border bg-slate-50"
+                        >
+                          <div className="flex items-center justify-between mb-1">
+                            <div className="text-xs text-slate-600">
+                              EN: {qp.en}
+                            </div>
+                            <button
+                              type="button"
+                              title={hasVoice ? "Speak (Turkish)" : "Speak"}
+                              aria-label="Speak"
+                              onClick={() => speak(qp.tr)}
+                              className="inline-flex items-center justify-center w-7 h-7 rounded-full hover:bg-slate-200 text-slate-700"
+                            >
+                              <SpeakerIcon className="w-4 h-4" />
+                            </button>
+                          </div>
+                          <div className="text-base">{qp.tr}</div>
+                        </div>
+                      ))}
                     </div>
                   </div>
-                </div>
+                )}
 
-                {/* Notes */}
+                {data.teaching && (
+                  <div className="space-y-2">
+                    <h3 className="font-medium">Learn</h3>
+                    {data.teaching.suffixes &&
+                      data.teaching.suffixes.length > 0 && (
+                        <div className="grid gap-3">
+                          {data.teaching.suffixes.map((suf, i) => (
+                            <div
+                              key={suf.id + i}
+                              className="p-3 rounded-xl border bg-slate-50"
+                            >
+                              <div className="flex items-start justify-between gap-2">
+                                <div className="min-w-0">
+                                  <div className="text-xs font-medium text-slate-700 truncate">
+                                    {suf.label}
+                                  </div>
+                                  {suf.concept && (
+                                    <div className="text-[11px] text-slate-500 leading-snug">
+                                      {suf.concept}
+                                    </div>
+                                  )}
+                                </div>
+                                {suf.example_tr && (
+                                  <button
+                                    onClick={() => speak(suf.example_tr!)}
+                                    className="inline-flex items-center justify-center w-7 h-7 rounded-full hover:bg-slate-200 text-slate-700"
+                                    title="Play example"
+                                  >
+                                    <SpeakerIcon className="w-4 h-4" />
+                                  </button>
+                                )}
+                              </div>
+                              {suf.rule && (
+                                <div className="text-xs text-slate-600 mt-1">
+                                  {suf.rule}
+                                </div>
+                              )}
+                              {suf.example_tr && (
+                                <div className="mt-2 text-sm">
+                                  <span className="font-medium">Example:</span>{" "}
+                                  {suf.example_tr}
+                                  {suf.example_en && (
+                                    <span className="text-slate-600">
+                                      {" "}
+                                      — {suf.example_en}
+                                    </span>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                    {data.teaching.drills &&
+                      data.teaching.drills.length > 0 && (
+                        <div className="space-y-3">
+                          <div className="text-sm font-medium">Drills</div>
+                          {data.teaching.drills.map((d, idx) => {
+                            const revealed = !!revealedDrills[idx];
+                            return (
+                              <div
+                                key={idx}
+                                className="p-3 rounded-xl border bg-slate-50"
+                              >
+                                <div className="text-sm">
+                                  {d.prompt_en && (
+                                    <div className="text-slate-800">
+                                      {d.prompt_en}
+                                    </div>
+                                  )}
+                                  {d.prompt_tr && (
+                                    <div className="text-slate-700 mt-0.5">
+                                      {d.prompt_tr}
+                                    </div>
+                                  )}
+                                </div>
+                                <div className="mt-2 flex items-center gap-2">
+                                  <button
+                                    onClick={() =>
+                                      setRevealedDrills((prev) => ({
+                                        ...prev,
+                                        [idx]: !revealed,
+                                      }))
+                                    }
+                                    className="text-xs px-2 py-1 rounded bg-slate-900 text-white hover:bg-black"
+                                  >
+                                    {revealed ? "Hide answer" : "Show answer"}
+                                  </button>
+                                  {revealed && (
+                                    <>
+                                      <div className="text-sm font-medium">
+                                        {d.answer_tr}
+                                      </div>
+                                      <button
+                                        onClick={() => speak(d.answer_tr)}
+                                        className="inline-flex items-center justify-center w-7 h-7 rounded-full hover:bg-slate-200 text-slate-700"
+                                        title="Play answer"
+                                      >
+                                        <SpeakerIcon className="w-4 h-4" />
+                                      </button>
+                                    </>
+                                  )}
+                                </div>
+                                {revealed && d.explanation && (
+                                  <div className="mt-1 text-xs text-slate-700">
+                                    {d.explanation}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                  </div>
+                )}
+
                 {data.notes && data.notes.length > 0 && (
                   <div className="space-y-1">
                     <h3 className="font-medium">Notes</h3>
@@ -1393,8 +1291,18 @@ function inflectionObjSchema() {
         type: "array",
         items: morphemeObjSchema(),
       },
+      display_title: { type: "string" },
+      display_hint: { type: "string" },
+      priority: { type: "number" },
     },
-    required: ["label", "surface", "segments"],
+    required: [
+      "label",
+      "surface",
+      "segments",
+      "display_title",
+      "display_hint",
+      "priority",
+    ],
   } as const;
 }
 
@@ -1416,12 +1324,10 @@ function exampleObjSchema() {
               additionalProperties: false,
               properties: {
                 surface: { type: "string" },
-                segments: {
-                  type: "array",
-                  items: morphemeObjSchema(),
-                },
+                segments: { type: "array", items: morphemeObjSchema() },
+                gloss: { type: "string" },
               },
-              required: ["surface", "segments"],
+              required: ["surface", "segments", "gloss"],
             },
           },
         },
@@ -1429,5 +1335,18 @@ function exampleObjSchema() {
       },
     },
     required: ["en", "tr"],
+  } as const;
+}
+
+function quickPhraseObjSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      key: { type: "string" },
+      tr: { type: "string" },
+      en: { type: "string" },
+    },
+    required: ["key", "tr", "en"],
   } as const;
 }
